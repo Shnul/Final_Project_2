@@ -1,4 +1,3 @@
-# kafka_to_postgres.py
 from kafka import KafkaConsumer
 import json
 import psycopg2
@@ -6,6 +5,10 @@ import logging
 import time
 from datetime import datetime
 from typing import Dict, Any
+from minio import Minio
+from minio.error import S3Error
+import pandas as pd
+import io
 
 # Configure logging
 logging.basicConfig(
@@ -21,6 +24,16 @@ DB_PARAMS = {
     'host': 'postgres', 
     'port': '5432'
 }
+
+# MinIO client configuration
+MINIO_CLIENT = Minio(
+    "minio:9000",
+    access_key="4uw9prJfbT1DMsHL",
+    secret_key="fpaRpPlRksIMgcvCHjZO4sowR4rM6qYq",
+    secure=False
+)
+CHECKPOINT_BUCKET = "checkpoints"
+CHECKPOINT_FILE = "kafka_checkpoint.parquet"
 
 def create_table() -> None:
     """Create exchange rates table if it doesn't exist"""
@@ -88,8 +101,38 @@ def create_consumer() -> KafkaConsumer:
         value_deserializer=lambda x: json.loads(x.decode('utf-8')),
         auto_offset_reset='earliest',
         group_id='exchange_rate_group',
-        enable_auto_commit=True
+        enable_auto_commit=False
     )
+
+def save_checkpoint(offset: int) -> None:
+    """Save the current offset to MinIO as a Parquet file"""
+    try:
+        df = pd.DataFrame([{"offset": offset}])
+        buffer = io.BytesIO()
+        df.to_parquet(buffer, index=False)
+        buffer.seek(0)
+        MINIO_CLIENT.put_object(
+            CHECKPOINT_BUCKET,
+            CHECKPOINT_FILE,
+            data=buffer,
+            length=buffer.getbuffer().nbytes,
+            content_type='application/octet-stream'
+        )
+        logging.info(f"Checkpoint saved at offset {offset}")
+    except S3Error as e:
+        logging.error(f"Failed to save checkpoint: {e}")
+
+def load_checkpoint() -> int:
+    """Load the last saved offset from MinIO as a Parquet file"""
+    try:
+        response = MINIO_CLIENT.get_object(CHECKPOINT_BUCKET, CHECKPOINT_FILE)
+        df = pd.read_parquet(io.BytesIO(response.read()))
+        response.close()
+        response.release_conn()
+        return df["offset"].iloc[0]
+    except S3Error as e:
+        logging.warning(f"Failed to load checkpoint: {e}")
+        return 0
 
 def main() -> None:
     """Main function to run the Kafka consumer"""
@@ -100,13 +143,18 @@ def main() -> None:
     try:
         create_table()
         consumer = create_consumer()
-        logging.info("Kafka consumer started. Waiting for messages...")
+        last_offset = load_checkpoint()
+        logging.info(f"Kafka consumer started from offset {last_offset}. Waiting for messages...")
         
         for message in consumer:
+            if message.offset <= last_offset:
+                continue
             try:
                 data = message.value
                 logging.info(f"Received message from partition {message.partition}, offset {message.offset}")
                 insert_exchange_rates(data)
+                save_checkpoint(message.offset)
+                consumer.commit()
             except Exception as e:
                 logging.error(f"Error processing message: {e}")
                 continue
