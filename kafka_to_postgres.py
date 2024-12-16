@@ -39,12 +39,12 @@ def create_table() -> None:
     """Create exchange rates table if it doesn't exist"""
     query = """
     CREATE TABLE IF NOT EXISTS exchange_rates (
-        id SERIAL PRIMARY KEY,
-        timestamp TIMESTAMP,
-        base_currency VARCHAR(3),
-        currency VARCHAR(3),
-        rate DECIMAL(20,10),
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    id SERIAL PRIMARY KEY,
+    timestamp TIMESTAMPTZ,
+    base_currency VARCHAR(3),
+    currency VARCHAR(3),
+    rate DECIMAL(20,10),
+    created_at TIMESTAMPTZ DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Jerusalem')
     );
     """
     try:
@@ -134,6 +134,23 @@ def load_checkpoint() -> int:
         logging.warning(f"Failed to load checkpoint: {e}")
         return 0
 
+def update_created_at() -> None:
+    """Update the created_at column to a specific date format"""
+    query = """
+    UPDATE exchange_rates
+    SET created_at = created_at AT TIME ZONE 'UTC'
+    WHERE created_at IS NOT NULL;
+    """
+    try:
+        with psycopg2.connect(**DB_PARAMS) as conn:
+            with conn.cursor() as cur:
+                cur.execute(query)
+            conn.commit()
+        logging.info("Updated created_at column to UTC timezone")
+    except psycopg2.Error as e:
+        logging.error(f"Failed to update created_at column: {e}")
+        raise
+
 def main() -> None:
     """Main function to run the Kafka consumer"""
     if not test_connection():
@@ -158,6 +175,8 @@ def main() -> None:
             except Exception as e:
                 logging.error(f"Error processing message: {e}")
                 continue
+                
+        update_created_at()
                 
     except KeyboardInterrupt:
         logging.info("Shutting down consumer...")
